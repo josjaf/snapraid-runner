@@ -16,6 +16,7 @@ from io import StringIO
 config = None
 email_log = None
 sync_duration_minutes = None
+scrub_duration_minutes = None
 
 
 def tee_log(infile, out_lines, log_level):
@@ -141,6 +142,8 @@ def send_notification(success):
 
     if sync_duration_minutes is not None:
         body += "Sync duration: {:.1f} minutes\n".format(sync_duration_minutes)
+    if scrub_duration_minutes is not None:
+        body += "Scrub duration: {:.1f} minutes\n".format(scrub_duration_minutes)
     body += "\n"
 
     if email_log is not None:
@@ -192,7 +195,7 @@ def load_config(args):
             config[section][k] = v.strip()
 
     int_options = [
-        ("snapraid", "deletethreshold"), ("logging", "maxsize"),
+        ("snapraid", "deletethreshold"),
         ("scrub", "older-than"), ("email", "maxsize"),
     ]
     for section, option in int_options:
@@ -233,11 +236,10 @@ def setup_logger():
     root_logger.addHandler(console_logger)
 
     if config["logging"]["file"]:
-        max_log_size = max(config["logging"]["maxsize"], 0) * 1024
         file_logger = logging.handlers.RotatingFileHandler(
             config["logging"]["file"],
-            maxBytes=max_log_size,
-            backupCount=9)
+            maxBytes=10 * 1024 * 1024,  # 10MB per file
+            backupCount=50)             # 500MB total
         file_logger.setFormatter(log_format)
         root_logger.addHandler(file_logger)
 
@@ -367,6 +369,116 @@ def run():
 
     logging.info("All done")
     finish(True)
+
+
+def run_scrub():
+    logging.info("=" * 60)
+    logging.info("Scrub started")
+    logging.info("=" * 60)
+
+    if not os.path.isfile(config["snapraid"]["executable"]):
+        logging.error("The configured snapraid executable \"{}\" does not "
+                      "exist or is not a file".format(
+                          config["snapraid"]["executable"]))
+        finish(False)
+    if not os.path.isfile(config["snapraid"]["config"]):
+        logging.error("Snapraid config does not exist at " +
+                      config["snapraid"]["config"])
+        finish(False)
+
+    if config["snapraid"]["touch"]:
+        logging.info("Running touch...")
+        snapraid_command("touch")
+        logging.info("*" * 60)
+
+    logging.info("Running scrub...")
+    try:
+        # Check if a percentage plan was given
+        int(config["scrub"]["plan"])
+    except ValueError:
+        scrub_args = {"plan": config["scrub"]["plan"]}
+    else:
+        scrub_args = {
+            "plan": config["scrub"]["plan"],
+            "older-than": config["scrub"]["older-than"],
+        }
+
+    global scrub_duration_minutes
+    scrub_start = time.time()
+    try:
+        snapraid_command("scrub", scrub_args)
+    except subprocess.CalledProcessError as e:
+        scrub_duration_minutes = (time.time() - scrub_start) / 60
+        logging.error(e)
+        finish(False)
+    scrub_duration_minutes = (time.time() - scrub_start) / 60
+    logging.info("Scrub completed in {:.1f} minutes".format(scrub_duration_minutes))
+    logging.info("*" * 60)
+
+    logging.info("All done")
+    finish(True)
+
+
+def scrub_main():
+    parser = argparse.ArgumentParser(
+        description="Run snapraid scrub with notifications")
+    parser.add_argument("-c", "--conf",
+                        default="snapraid-runner.conf",
+                        metavar="CONFIG",
+                        help="Configuration file (default: %(default)s)")
+    parser.add_argument("--plan",
+                        default=None,
+                        help="Override scrub plan (e.g. 15, bad, new, full)")
+    parser.add_argument("--older-than",
+                        default=None,
+                        type=int,
+                        help="Override scrub older-than days")
+    parser.add_argument("--touch",
+                        action="store_true",
+                        default=False,
+                        help="Run touch before scrub")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.conf):
+        print("snapraid-runner configuration file not found")
+        parser.print_help()
+        sys.exit(2)
+
+    # Build a compatible args object for load_config
+    args.scrub = None
+    args.ignore_deletethreshold = False
+
+    try:
+        load_config(args)
+    except Exception:
+        print("unexpected exception while loading config")
+        print(traceback.format_exc())
+        sys.exit(2)
+
+    # Apply CLI overrides
+    if args.plan is not None:
+        config["scrub"]["plan"] = args.plan
+        # Re-parse as int if numeric so older-than logic works
+        try:
+            config["scrub"]["plan"] = int(config["scrub"]["plan"])
+        except ValueError:
+            pass
+    if args.older_than is not None:
+        config["scrub"]["older-than"] = args.older_than
+    if args.touch:
+        config["snapraid"]["touch"] = True
+    try:
+        setup_logger()
+    except Exception:
+        print("unexpected exception while setting up logging")
+        print(traceback.format_exc())
+        sys.exit(2)
+
+    try:
+        run_scrub()
+    except Exception:
+        logging.exception("Run failed due to unexpected exception:")
+        finish(False)
 
 
 if __name__ == "__main__":

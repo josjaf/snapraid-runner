@@ -1,3 +1,3 @@
-from .SnapraidRunner import main
+from .SnapraidRunner import main, scrub_main
 
-VERSION = '0.6'
+VERSION = '0.7'

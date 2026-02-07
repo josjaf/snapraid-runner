@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 snapraid-runner = "snapraid_runner:main"
+snapraid-scrub = "snapraid_runner:scrub_main"
 
 [tool.hatch.version]
 path = "snapraid_runner/__init__.py"
