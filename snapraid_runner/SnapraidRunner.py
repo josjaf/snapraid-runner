@@ -15,6 +15,7 @@ from io import StringIO
 # Global variables
 config = None
 email_log = None
+sync_duration_minutes = None
 
 
 def tee_log(infile, out_lines, log_level):
@@ -134,9 +135,13 @@ def send_notification(success):
     # use quoted-printable instead of the default base64
     charset.add_charset("utf-8", charset.SHORTEST, charset.QP)
     if success:
-        body = "SnapRAID job completed successfully:\n\n\n"
+        body = "SnapRAID job completed successfully:\n\n"
     else:
-        body = "Error during SnapRAID job:\n\n\n"
+        body = "Error during SnapRAID job:\n\n"
+
+    if sync_duration_minutes is not None:
+        body += "Sync duration: {:.1f} minutes\n".format(sync_duration_minutes)
+    body += "\n"
 
     if email_log is not None:
         log = email_log.getvalue()
@@ -329,11 +334,16 @@ def run():
         logging.info("No changes detected, no sync required")
     else:
         logging.info("Running sync...")
+        global sync_duration_minutes
+        sync_start = time.time()
         try:
             snapraid_command("sync")
         except subprocess.CalledProcessError as e:
+            sync_duration_minutes = (time.time() - sync_start) / 60
             logging.error(e)
             finish(False)
+        sync_duration_minutes = (time.time() - sync_start) / 60
+        logging.info("Sync completed in {:.1f} minutes".format(sync_duration_minutes))
         logging.info("*" * 60)
 
     if config["scrub"]["enabled"]:
