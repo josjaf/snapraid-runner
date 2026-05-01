@@ -11,6 +11,8 @@ touch = false
 [logging]
 ; logfile to write to, leave empty to disable
 file = snapraid.log
+; separate logfile for scrub output only, leave empty to disable
+scrub_file =
 ; maximum logfile size in KiB, leave empty for infinite
 maxsize = 5000
 

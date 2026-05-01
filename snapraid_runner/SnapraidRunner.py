@@ -17,6 +17,13 @@ config = None
 email_log = None
 sync_duration_minutes = None
 scrub_duration_minutes = None
+job_start_time = None
+_scrubbing = False
+
+
+class ScrubFilter(logging.Filter):
+    def filter(self, record):
+        return _scrubbing
 
 
 def tee_log(infile, out_lines, log_level):
@@ -135,16 +142,22 @@ def send_notification(success):
 
     # use quoted-printable instead of the default base64
     charset.add_charset("utf-8", charset.SHORTEST, charset.QP)
-    if success:
-        body = "SnapRAID job completed successfully:\n\n"
-    else:
-        body = "Error during SnapRAID job:\n\n"
 
-    if sync_duration_minutes is not None:
-        body += "Sync duration: {:.1f} minutes\n".format(sync_duration_minutes)
+    status = "SUCCESS" if success else "ERROR"
     if scrub_duration_minutes is not None:
-        body += "Scrub duration: {:.1f} minutes\n".format(scrub_duration_minutes)
-    body += "\n"
+        job_type = "Scrub"
+        duration = scrub_duration_minutes
+    elif sync_duration_minutes is not None:
+        job_type = "Sync"
+        duration = sync_duration_minutes
+    else:
+        job_type = "Job"
+        duration = (time.time() - job_start_time) / 60 if job_start_time else None
+
+    summary = "{} {}".format(job_type, status)
+    if duration is not None:
+        summary += " {:.1f}min".format(duration)
+    body = summary + "\n"
 
     if email_log is not None:
         log = email_log.getvalue()
@@ -159,10 +172,7 @@ def send_notification(success):
                 log[-maxsize // 2:])
         body += log
 
-    title = config["email"]["subject"] + \
-        (" SUCCESS" if success else " ERROR")
-
-    apobj.notify(body=body, title=title)
+    apobj.notify(body=body, title=None)
 
 
 
@@ -242,6 +252,17 @@ def setup_logger():
             backupCount=50)             # 500MB total
         file_logger.setFormatter(log_format)
         root_logger.addHandler(file_logger)
+        logging.info("Logging to: {}".format(config["logging"]["file"]))
+
+    if config["logging"]["scrub_file"]:
+        scrub_file_logger = logging.handlers.RotatingFileHandler(
+            config["logging"]["scrub_file"],
+            maxBytes=10 * 1024 * 1024,  # 10MB per file
+            backupCount=50)             # 500MB total
+        scrub_file_logger.setFormatter(log_format)
+        scrub_file_logger.addFilter(ScrubFilter())
+        root_logger.addHandler(scrub_file_logger)
+        logging.info("Scrub logging to: {}".format(config["logging"]["scrub_file"]))
 
     if config["email"]["sendon"]:
         global email_log
@@ -294,6 +315,8 @@ def main():
 
 
 def run():
+    global job_start_time
+    job_start_time = time.time()
     logging.info("=" * 60)
     logging.info("Run started")
     logging.info("=" * 60)
@@ -349,6 +372,8 @@ def run():
         logging.info("*" * 60)
 
     if config["scrub"]["enabled"]:
+        global _scrubbing, scrub_duration_minutes
+        _scrubbing = True
         logging.info("Running scrub...")
         try:
             # Check if a percentage plan was given
@@ -360,18 +385,26 @@ def run():
                 "plan": config["scrub"]["plan"],
                 "older-than": config["scrub"]["older-than"],
             }
+        scrub_start = time.time()
         try:
             snapraid_command("scrub", scrub_args)
         except subprocess.CalledProcessError as e:
+            scrub_duration_minutes = (time.time() - scrub_start) / 60
             logging.error(e)
+            _scrubbing = False
             finish(False)
+        scrub_duration_minutes = (time.time() - scrub_start) / 60
         logging.info("*" * 60)
+        _scrubbing = False
 
     logging.info("All done")
     finish(True)
 
 
 def run_scrub():
+    global _scrubbing, job_start_time
+    job_start_time = time.time()
+    _scrubbing = True
     logging.info("=" * 60)
     logging.info("Scrub started")
     logging.info("=" * 60)
