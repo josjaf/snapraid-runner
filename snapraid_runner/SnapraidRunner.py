@@ -42,13 +42,14 @@ def tee_log(infile, out_lines, log_level):
     return t
 
 
-def snapraid_command(command, args={}, *, allow_statuscodes=[]):
+def snapraid_command(command, args=None, *, allow_statuscodes=[]):
     """
     Run snapraid command
     Raises subprocess.CalledProcessError if errorlevel != 0
     """
     arguments = ["--conf", config["snapraid"]["config"],
                  "--quiet"]
+    args = args or {}
     for (k, v) in args.items():
         arguments.extend(["--" + k, str(v)])
     p = subprocess.Popen(
@@ -74,6 +75,19 @@ def snapraid_command(command, args={}, *, allow_statuscodes=[]):
         raise subprocess.CalledProcessError(ret, "snapraid " + command)
 
 
+def truncate_log(log, maxsize):
+    """Shorten log to maxsize bytes by cutting out the middle, if needed"""
+    if maxsize and len(log) > maxsize:
+        cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
+        log = (
+            "NOTE: Log was too big for email and was shortened\n\n" +
+            log[:maxsize // 2] +
+            "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
+                cut_lines) +
+            log[-maxsize // 2:])
+    return log
+
+
 def send_email(success):
     import smtplib
     from email.mime.text import MIMEText
@@ -90,17 +104,8 @@ def send_email(success):
     else:
         body = "Error during SnapRAID job:\n\n\n"
 
-    log = email_log.getvalue()
     maxsize = config['email'].get('maxsize', 500) * 1024
-    if maxsize and len(log) > maxsize:
-        cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
-        log = (
-            "NOTE: Log was too big for email and was shortened\n\n" +
-            log[:maxsize // 2] +
-            "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
-                cut_lines) +
-            log[-maxsize // 2:])
-    body += log
+    body += truncate_log(email_log.getvalue(), maxsize)
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = config["email"]["subject"] + \
@@ -126,8 +131,10 @@ def send_email(success):
 
 def send_notification(success):
     import apprise
-    from email.mime.text import MIMEText
-    from email import charset
+
+    if len(config["notifications"]["services"]) == 0:
+        logging.error("Failed to send notification because no notification services are set")
+        return
 
     ap_asset = apprise.AppriseAsset()
     apobj = apprise.Apprise(asset=ap_asset)
@@ -135,13 +142,6 @@ def send_notification(success):
     for url in config["notifications"]["services"]:
         if not apobj.add(url):
             logging.error('\'%s\' is an invalid AppRise URL.' % (url))
-
-    if len(config["notifications"]["services"]) == 0:
-        logging.error("Failed to send notification because no notification services are set")
-        return
-
-    # use quoted-printable instead of the default base64
-    charset.add_charset("utf-8", charset.SHORTEST, charset.QP)
 
     status = "SUCCESS" if success else "ERROR"
     if scrub_duration_minutes is not None:
@@ -160,17 +160,8 @@ def send_notification(success):
     body = summary + "\n"
 
     if email_log is not None:
-        log = email_log.getvalue()
         maxsize = config['email'].get('maxsize', 500) * 1024
-        if maxsize and len(log) > maxsize:
-            cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
-            log = (
-                "NOTE: Log was too big for email and was shortened\n\n" +
-                log[:maxsize // 2] +
-                "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
-                    cut_lines) +
-                log[-maxsize // 2:])
-        body += log
+        body += truncate_log(email_log.getvalue(), maxsize)
 
     apobj.notify(body=body, title=None)
 
@@ -219,7 +210,8 @@ def load_config(args):
     config["scrub"]["enabled"] = (config["scrub"]["enabled"].lower() == "true")
     config["email"]["short"] = (config["email"]["short"].lower() == "true")
     config["snapraid"]["touch"] = (config["snapraid"]["touch"].lower() == "true")
-    config["notifications"]["services"] = config["notifications"]["services"].split(',')
+    config["notifications"]["services"] = [
+        s.strip() for s in config["notifications"]["services"].split(',') if s.strip()]
 
     # Migration
     if config["scrub"]["percentage"]:
@@ -314,6 +306,37 @@ def main():
         finish(False)
 
 
+def build_scrub_args():
+    """Build snapraid scrub args from config; older-than only applies to percentage plans"""
+    try:
+        # Check if a percentage plan was given
+        int(config["scrub"]["plan"])
+    except ValueError:
+        return {"plan": config["scrub"]["plan"]}
+    else:
+        return {
+            "plan": config["scrub"]["plan"],
+            "older-than": config["scrub"]["older-than"],
+        }
+
+
+def run_scrub_command():
+    """
+    Run snapraid scrub, tracking scrub_duration_minutes.
+    Re-raises subprocess.CalledProcessError after logging it.
+    """
+    global scrub_duration_minutes
+    scrub_args = build_scrub_args()
+    scrub_start = time.time()
+    try:
+        snapraid_command("scrub", scrub_args)
+    except subprocess.CalledProcessError as e:
+        scrub_duration_minutes = (time.time() - scrub_start) / 60
+        logging.error(e)
+        raise
+    scrub_duration_minutes = (time.time() - scrub_start) / 60
+
+
 def run():
     global job_start_time
     job_start_time = time.time()
@@ -372,28 +395,14 @@ def run():
         logging.info("*" * 60)
 
     if config["scrub"]["enabled"]:
-        global _scrubbing, scrub_duration_minutes
+        global _scrubbing
         _scrubbing = True
         logging.info("Running scrub...")
         try:
-            # Check if a percentage plan was given
-            int(config["scrub"]["plan"])
-        except ValueError:
-            scrub_args = {"plan": config["scrub"]["plan"]}
-        else:
-            scrub_args = {
-                "plan": config["scrub"]["plan"],
-                "older-than": config["scrub"]["older-than"],
-            }
-        scrub_start = time.time()
-        try:
-            snapraid_command("scrub", scrub_args)
-        except subprocess.CalledProcessError as e:
-            scrub_duration_minutes = (time.time() - scrub_start) / 60
-            logging.error(e)
+            run_scrub_command()
+        except subprocess.CalledProcessError:
             _scrubbing = False
             finish(False)
-        scrub_duration_minutes = (time.time() - scrub_start) / 60
         logging.info("*" * 60)
         _scrubbing = False
 
@@ -426,25 +435,9 @@ def run_scrub():
 
     logging.info("Running scrub...")
     try:
-        # Check if a percentage plan was given
-        int(config["scrub"]["plan"])
-    except ValueError:
-        scrub_args = {"plan": config["scrub"]["plan"]}
-    else:
-        scrub_args = {
-            "plan": config["scrub"]["plan"],
-            "older-than": config["scrub"]["older-than"],
-        }
-
-    global scrub_duration_minutes
-    scrub_start = time.time()
-    try:
-        snapraid_command("scrub", scrub_args)
-    except subprocess.CalledProcessError as e:
-        scrub_duration_minutes = (time.time() - scrub_start) / 60
-        logging.error(e)
+        run_scrub_command()
+    except subprocess.CalledProcessError:
         finish(False)
-    scrub_duration_minutes = (time.time() - scrub_start) / 60
     logging.info("Scrub completed in {:.1f} minutes".format(scrub_duration_minutes))
     logging.info("*" * 60)
 

@@ -1,5 +1,6 @@
-rsync -rtvap --exclude .venv . jj@tv:/opt/snapraid-runner 
+rsync -rtvap --exclude .venv . jj@tv:/opt/snapraid-runner
 # uv tool install as root
+sudo git config --global --add safe.directory /opt/snapraid-runner
 sudo uv tool install --reinstall .
 /home/jj/.local/bin/snapraid-runner -c /media/red/p/code/snapraid/snapraid-runner.conf
 /home/jj/.local/bin/snapraid-runner
